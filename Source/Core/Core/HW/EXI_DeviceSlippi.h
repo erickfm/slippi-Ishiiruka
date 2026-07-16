@@ -25,6 +25,9 @@
 #define CONNECT_CODE_LENGTH 8
 
 extern bool g_needInputForFrame;
+extern bool g_slippiInGame;
+extern u8 g_slippiPlayerType[4];
+extern u32 g_slippiFrameEpoch;
 
 // Emulated Slippi device used to receive and respond to in-game messages
 class CEXISlippi : public IEXIDevice

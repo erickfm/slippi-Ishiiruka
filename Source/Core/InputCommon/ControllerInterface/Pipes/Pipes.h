@@ -16,6 +16,9 @@
 #include "Core/Slippi/SlippiPad.h"
 
 extern bool g_needInputForFrame;
+extern bool g_slippiInGame;
+extern u8 g_slippiPlayerType[4];
+extern u32 g_slippiFrameEpoch;
 
 namespace ciface
 {
@@ -50,6 +53,11 @@ public:
   std::string GetName() const override { return m_name; }
   std::string GetSource() const override { return "Pipe"; }
   SlippiPad GetSlippiPad();
+  // Frame-synced input mode support (see Pipes.cpp).
+  bool IsStrict() const;
+  bool DrainAndParse(bool barrier_mode, bool* barrier);
+  PIPE_FD GetFD() const { return m_fd; }
+  u32 GetFlushesSeen() const { return m_flushes_seen; }
 private:
   class PipeInput : public Input
   {
@@ -71,6 +79,16 @@ private:
 
   const PIPE_FD m_fd;
   const std::string m_name;
+  // Controller port (0-3) this pipe drives, derived from the libmelee
+  // naming convention "slippibot<port>"; -1 if the name doesn't match.
+  int m_slippi_port = -1;
+  // Frame-sync ledger (see Pipes.cpp): outstanding keep-alive flushes of
+  // the last accepted cycle, command adjacency for bare-flush detection,
+  // and a running flush counter for the barrier safety valve.
+  int m_tail_expect = 0;
+  int m_cmds_since_flush = 0;
+  bool m_last_flush_had_data = false;
+  u32 m_flushes_seen = 0;
   std::string m_buf;
   std::map<std::string, PipeInput*> m_buttons;
   std::map<std::string, PipeInput*> m_axes;

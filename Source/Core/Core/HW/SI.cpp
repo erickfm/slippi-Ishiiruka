@@ -627,6 +627,9 @@ void ChangeDeviceDeterministic(SIDevices device, int channel)
 
 void UpdateDevices()
 {
+	static bool trace = getenv("PIPE_TRACE") != nullptr;
+	if (trace)
+		fprintf(stderr, "[PT] SI-update\n");
 	// Update inputs at 240 hz
 	g_controller_interface.UpdateInput();
 

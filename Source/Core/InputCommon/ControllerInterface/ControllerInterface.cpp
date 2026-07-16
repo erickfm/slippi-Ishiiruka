@@ -2,6 +2,8 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 #include "Common/Thread.h"
@@ -212,15 +214,20 @@ void ControllerInterface::RemoveDevice(std::function<bool(const ciface::Core::De
 //
 void ControllerInterface::UpdateInput()
 {
+	static bool trace = getenv("PIPE_TRACE") != nullptr;
 	// Don't block the UI or CPU thread (to avoid a short but noticeable frame drop)
 	if (m_devices_mutex.try_lock())
 	{
 		std::lock_guard<std::mutex> lk(m_devices_mutex, std::adopt_lock);
+		if (trace)
+			fprintf(stderr, "[PT] CI-update begin flag=%d\n", (int)g_needInputForFrame);
 		for (const auto& d : m_devices)
 			d->UpdateInput();
 
 		g_needInputForFrame = false;
 	}
+	else if (trace)
+		fprintf(stderr, "[PT] CI-update SKIPPED (lock) flag=%d\n", (int)g_needInputForFrame);
 }
 
 //

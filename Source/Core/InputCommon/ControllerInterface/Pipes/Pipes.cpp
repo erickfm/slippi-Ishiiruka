@@ -2,6 +2,7 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -94,8 +95,17 @@ void PopulateDevices()
   #endif
 }
 
+static bool s_pipe_trace = getenv("PIPE_TRACE") != nullptr;
+static std::vector<PipeDevice*> s_pipe_registry;
+
 PipeDevice::PipeDevice(PIPE_FD fd, const std::string& name) : m_fd(fd), m_name(name)
 {
+  // libmelee names bot pipes "slippibot<port>" (1-based). Knowing the port
+  // lets UpdateInput consult the per-port player type for frame syncing.
+  if (m_name.rfind("slippibot", 0) == 0 && m_name.size() == 10 &&
+      m_name[9] >= '1' && m_name[9] <= '4')
+    m_slippi_port = m_name[9] - '1';
+  s_pipe_registry.push_back(this);
   for (const auto& tok : s_button_tokens)
   {
     PipeInput* btn = new PipeInput("Button " + tok);
@@ -115,6 +125,9 @@ PipeDevice::PipeDevice(PIPE_FD fd, const std::string& name) : m_fd(fd), m_name(n
 
 PipeDevice::~PipeDevice()
 {
+  s_pipe_registry.erase(
+      std::remove(s_pipe_registry.begin(), s_pipe_registry.end(), this),
+      s_pipe_registry.end());
   #ifdef _WIN32
   CloseHandle(m_fd);
   #else
@@ -163,10 +176,242 @@ s32 PipeDevice::readFromPipe(PIPE_FD file_descriptor, char *in_buffer, size_t si
   #endif
 }
 
+// Read everything currently available and parse all complete commands.
+// Returns false if the pipe died (writer closed), true otherwise.
+//
+// In barrier mode, each parsed FLUSH is classified against the frame-sync
+// ledger (see the strict-mode comment below):
+//   - the first m_tail_expect flushes are the previous cycle's outstanding
+//     keep-alive tail — consumed, never a barrier;
+//   - the next flush satisfies the frame barrier (*barrier = true). If it
+//     carried data (non-FLUSH commands since the previous flush), the
+//     client's final keep-alive for this cycle is still outstanding, so
+//     m_tail_expect is incremented for the next frame;
+//   - further flushes in the same drain re-enter the same ledger (e.g. the
+//     keep-alive right behind a data burst cancels the increment).
+bool PipeDevice::DrainAndParse(bool barrier_mode, bool* barrier)
+{
+  char buf[32];
+  bool died = false;
+  s32 bytes_read = readFromPipe(m_fd, buf, sizeof buf);
+  if (bytes_read == 0)
+    died = true;  // writer closed; parse what we have, then bail
+  while (bytes_read > 0)
+  {
+    m_buf.append(buf, bytes_read);
+    bytes_read = readFromPipe(m_fd, buf, sizeof buf);
+    if (bytes_read == 0)
+      died = true;
+  }
+  std::size_t newline = m_buf.find("\n");
+  while (newline != std::string::npos)
+  {
+    std::string command = m_buf.substr(0, newline);
+    bool is_flush = ParseCommand(command);
+    if (is_flush)
+    {
+      m_flushes_seen++;
+      if (barrier_mode)
+      {
+        if (m_tail_expect > 0)
+          m_tail_expect--;
+        else if (barrier && !*barrier)
+        {
+          *barrier = true;
+          if (m_last_flush_had_data)
+            m_tail_expect++;
+        }
+        // else: extra bare flush beyond the barrier — ignore.
+      }
+    }
+    m_buf.erase(0, newline + 1);
+    newline = m_buf.find("\n");
+  }
+  return !died;
+}
+
+// --- Frame-synced ("strict") input mode -------------------------------------
+//
+// Used in-game for pipes that drive a HUMAN port when blocking pipes are on.
+// It fixes a dual-pad input desync under fast-forward.
+//
+// Background: libmelee's console.step() writes one bare keep-alive FLUSH to
+// EVERY controller pipe at the start of every step, in addition to the bot's
+// real "commands + FLUSH" burst written between steps. The legacy per-device
+// wait ends on the FIRST flush it sees, so a keep-alive flush left over from
+// the previous frame can satisfy the per-frame blocking wait before the
+// bot's real burst for this frame has arrived. The 0xD9 pad snapshot then
+// serves stale inputs, the fresh burst is consumed mid-frame by the
+// (non-blocking) 240 Hz SI polls, and each port independently oscillates
+// between on-time and one-frame-late input — ~40-60% of frames landed late
+// in dual-pad FFW self-play, destroying frame-tight play (L-cancels etc).
+// Single-pad vs-CPU setups dodge the race by accident of device iteration
+// order, and realtime dodges it because the 16.7 ms frame lets the SI polls
+// mop up the keep-alive before the next frame's wait.
+//
+// Strict mode instead runs ONE combined wait per frame across ALL strict
+// pipes, triggered by whichever strict device the frame's first input sweep
+// reaches first (g_slippiFrameEpoch identifies the frame). Per client cycle
+// (= its response to one gamestate) a pipe carries, in order: the bot's
+// command burst ending in a data-carrying FLUSH (if the bot acted), then the
+// bare keep-alive FLUSH from console.step()'s flush-all. The barrier for
+// frame f must accept exactly one cycle per frame and must not let cycle
+// f-1's trailing keep-alive stand in for cycle f. Each pipe keeps a ledger
+// (m_tail_expect) of how many trailing keep-alives of the accepted cycle are
+// still outstanding:
+//   - flushes covered by m_tail_expect are the previous cycle's tail —
+//     consumed, never a barrier;
+//   - the first flush beyond the tail satisfies this frame's barrier,
+//     whether it was already buffered (the client ran ahead of the wait —
+//     normal in realtime pacing, or when a legacy blocking pipe earlier in
+//     the sweep already absorbed the client round-trip) or arrives during
+//     the wait (normal in FFW, where the wait starts microseconds after the
+//     bookend). A data-carrying barrier flush leaves one keep-alive
+//     outstanding (m_tail_expect++); a bare one IS the keep-alive;
+//   - extra flushes drained behind the barrier flush re-enter the ledger
+//     (the keep-alive right behind a data burst cancels the increment).
+//
+// Outside the combined wait, strict pipes consume nothing (mid-frame polls
+// are no-ops), so cycle tails stay buffered for the next barrier's ledger
+// instead of being stripped mid-frame at unpredictable times.
+//
+// Pipes on CPU/empty ports are excluded (legacy path): the game ignores
+// their pads, and their pipes may receive nothing but keep-alives.
+//
+// Safety valve: a bounded wait accepts any flush consumed within this
+// barrier call (even ledger-classified tail) rather than deadlocking, e.g.
+// for clients with unusual multi-flush cycles that momentarily confuse the
+// ledger. A pipe that produced no flush at all keeps blocking, as before.
+
+static u32 s_served_epoch = ~0u;
+
+bool PipeDevice::IsStrict() const
+{
+  return SConfig::GetInstance().m_blockingPipes && g_slippiInGame &&
+         m_slippi_port >= 0 && g_slippiPlayerType[m_slippi_port] == 0;
+}
+
+#ifndef _WIN32
+static void CombinedFrameWait()
+{
+  std::vector<PipeDevice*> pipes;
+  for (PipeDevice* d : s_pipe_registry)
+    if (d->IsStrict())
+      pipes.push_back(d);
+  if (pipes.empty())
+    return;
+
+  const size_t n = pipes.size();
+  std::vector<char> barrier(n, 0), dead(n, 0);
+  std::vector<u32> flushes_at_entry(n);
+  for (size_t i = 0; i < n; i++)
+    flushes_at_entry[i] = pipes[i]->GetFlushesSeen();
+
+  // Consume whatever is already buffered; the ledger inside DrainAndParse
+  // decides whether it contains this frame's barrier flush.
+  for (size_t i = 0; i < n; i++)
+  {
+    bool b = false;
+    if (!pipes[i]->DrainAndParse(true, &b))
+      dead[i] = 1;
+    barrier[i] = b;
+  }
+
+  // Block until every live strict pipe has crossed its frame barrier.
+  int waited_ms = 0;
+  while (true)
+  {
+    fd_set set;
+    FD_ZERO(&set);
+    int maxfd = -1;
+    bool pending = false;
+    for (size_t i = 0; i < n; i++)
+    {
+      if (dead[i] || barrier[i])
+        continue;
+      int fd = pipes[i]->GetFD();
+      FD_SET(fd, &set);
+      if (fd > maxfd)
+        maxfd = fd;
+      pending = true;
+    }
+    if (!pending)
+      break;
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 250000;
+    int ret = select(maxfd + 1, &set, NULL, NULL, &tv);
+    if (ret == 0)
+    {
+      waited_ms += 250;
+      // Valve: release pipes that consumed at least one flush during this
+      // barrier call even if the ledger classified it as tail.
+      bool released = false;
+      for (size_t i = 0; i < n; i++)
+      {
+        if (!dead[i] && !barrier[i] &&
+            pipes[i]->GetFlushesSeen() != flushes_at_entry[i])
+        {
+          barrier[i] = 1;
+          released = true;
+        }
+      }
+      if (released)
+        fprintf(stderr,
+                "PipeDevice: combined frame wait timed out after %d ms; "
+                "proceeding on tail flush(es)\n", waited_ms);
+      continue;
+    }
+    for (size_t i = 0; i < n; i++)
+    {
+      if (dead[i] || barrier[i])
+        continue;
+      if (FD_ISSET(pipes[i]->GetFD(), &set))
+      {
+        bool b = false;
+        if (!pipes[i]->DrainAndParse(true, &b))
+          dead[i] = 1;
+        barrier[i] = barrier[i] || b;
+      }
+    }
+  }
+  if (s_pipe_trace)
+    for (size_t i = 0; i < n; i++)
+      fprintf(stderr, "[PT] pipe=%s frame-wait flushes=%u barrier=%d dead=%d\n",
+              pipes[i]->GetName().c_str(),
+              pipes[i]->GetFlushesSeen() - flushes_at_entry[i],
+              (int)barrier[i], (int)dead[i]);
+}
+#endif
+
 void PipeDevice::UpdateInput()
 {
+  const bool blocking = SConfig::GetInstance().m_blockingPipes;
+  const bool wait_for_inputs = blocking && g_needInputForFrame;
+
+  #ifndef _WIN32
+  if (IsStrict())
+  {
+    // Strict pipes consume only via the once-per-frame combined wait.
+    if (g_needInputForFrame && s_served_epoch != g_slippiFrameEpoch)
+    {
+      s_served_epoch = g_slippiFrameEpoch;
+      CombinedFrameWait();
+    }
+    return;
+  }
+  #endif
+
+  if (s_pipe_trace)
+    fprintf(stderr, "[PT] pipe=%s wait=%d strict=0\n", m_name.c_str(),
+            (int)wait_for_inputs);
+
+  int trace_cmds = 0, trace_flushes = 0;
+
+  // Legacy path (menus, boot, non-blocking mode, CPU/unknown ports,
+  // Windows): unchanged semantics.
   bool finished = false;
-  bool wait_for_inputs = SConfig::GetInstance().m_blockingPipes && g_needInputForFrame;
   #ifndef _WIN32
   if(wait_for_inputs)
   {
@@ -198,11 +443,17 @@ void PipeDevice::UpdateInput()
     {
       std::string command = m_buf.substr(0, newline);
       finished = ParseCommand(command);
+      trace_cmds++;
+      if (finished)
+        trace_flushes++;
 
       m_buf.erase(0, newline + 1);
       newline = m_buf.find("\n");
     }
   } while(!finished && wait_for_inputs);
+  if (s_pipe_trace)
+    fprintf(stderr, "[PT] pipe=%s done cmds=%d flushes=%d strict=0\n",
+            m_name.c_str(), trace_cmds, trace_flushes);
 }
 
 void PipeDevice::AddAxis(const std::string& name, double value)
@@ -270,8 +521,11 @@ bool PipeDevice::ParseCommand(const std::string& command)
     // Let ControllerInterface.cpp clear the flag after all PipeDevices
     // have been queried.
     // g_needInputForFrame = false;
+    m_last_flush_had_data = m_cmds_since_flush > 0;
+    m_cmds_since_flush = 0;
     return true;
   }
+  m_cmds_since_flush++;
   std::vector<std::string> tokens;
   SplitString(command, ' ', tokens);
   if (tokens.size() < 2 || tokens.size() > 4)

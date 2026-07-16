@@ -67,6 +67,16 @@ int localChatMessageId = 0;
 //  Is set to true between frames
 bool g_needInputForFrame = false;
 
+// Frame-sync metadata for blocking bot pipes (see Pipes.cpp).
+// g_slippiInGame is true between GAME_INFO (0x36) and GAME_END / menu frames.
+// g_slippiPlayerType holds the per-port player type from the Slippi
+// GAME_START event: 0 = human, 1 = cpu, 2 = demo, 3 = empty, 0xFF = unknown.
+bool g_slippiInGame = false;
+u8 g_slippiPlayerType[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+// Incremented every time g_needInputForFrame is raised; lets the pipe input
+// code run its combined per-frame wait exactly once per frame.
+u32 g_slippiFrameEpoch = 0;
+
 template <typename T> bool isFutureReady(std::future<T> &t)
 {
 	return t.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
@@ -3247,8 +3257,12 @@ void CEXISlippi::handleGetRank()
 	m_read_queue.push_back(static_cast<u8>(rank_info.rank_change));
 }
 
+static bool s_pt_trace = getenv("PIPE_TRACE") != nullptr;
+
 void CEXISlippi::prepareOverwriteInputs()
 {
+	if (s_pt_trace)
+		fprintf(stderr, "[PT] D9 begin\n");
 	m_read_queue.clear();
 	// If blocking pipe input is configured, this will block until pipe input is sent for this frame
 	g_controller_interface.UpdateInput();
@@ -3274,6 +3288,10 @@ void CEXISlippi::prepareOverwriteInputs()
 			appendWordToBuffer(&m_read_queue, 0);
 		}
 	}
+	if (s_pt_trace)
+		fprintf(stderr, "[PT] D9 end p1x=%d p2x=%d\n",
+		        pads.count(0) ? (int)(s8)pads[0].padBuf[2] : -999,
+		        pads.count(1) ? (int)(s8)pads[1].padBuf[2] : -999);
 }
 
 void CEXISlippi::DMAWrite(u32 _uAddr, u32 _uSize)
@@ -3300,6 +3318,11 @@ void CEXISlippi::DMAWrite(u32 _uAddr, u32 _uSize)
 		writeToFileAsync(&memPtr[0], receiveCommandsLen + 1, "create");
 		bufLoc += receiveCommandsLen + 1;
 		g_needInputForFrame = true;
+		g_slippiFrameEpoch++;
+		// New game incoming: player types arrive with CMD_RECEIVE_GAME_INFO.
+		g_slippiInGame = false;
+		for (int i = 0; i < 4; i++)
+			g_slippiPlayerType[i] = 0xFF;
 
 		m_slippiserver->startGame();
 		m_slippiserver->write(&memPtr[0], receiveCommandsLen + 1);
@@ -3311,6 +3334,8 @@ void CEXISlippi::DMAWrite(u32 _uAddr, u32 _uSize)
 	{
 		m_slippiserver->write(&memPtr[0], _uSize);
 		g_needInputForFrame = true;
+		g_slippiFrameEpoch++;
+		g_slippiInGame = false;
 		return;
 	}
 
@@ -3335,6 +3360,7 @@ void CEXISlippi::DMAWrite(u32 _uAddr, u32 _uSize)
 		switch (byte)
 		{
 		case CMD_RECEIVE_GAME_END:
+			g_slippiInGame = false;
 			writeToFileAsync(&memPtr[bufLoc], payloadLen + 1, "close");
 			m_slippiserver->write(&memPtr[bufLoc], payloadLen + 1);
 			m_slippiserver->endGame();
@@ -3348,7 +3374,10 @@ void CEXISlippi::DMAWrite(u32 _uAddr, u32 _uSize)
 			prepareFrameData(&memPtr[bufLoc + 1]);
 			break;
 		case CMD_FRAME_BOOKEND:
+			if (s_pt_trace)
+				fprintf(stderr, "[PT] BOOKEND\n");
 			g_needInputForFrame = true;
+			g_slippiFrameEpoch++;
 			writeToFileAsync(&memPtr[bufLoc], payloadLen + 1, "");
 			m_slippiserver->write(&memPtr[bufLoc], payloadLen + 1);
 			slprs_exi_device_reporter_push_replay_data(slprs_exi_device_ptr, &memPtr[bufLoc], payloadLen + 1);
@@ -3480,6 +3509,23 @@ void CEXISlippi::DMAWrite(u32 _uAddr, u32 _uSize)
 		case CMD_OVERWRITE_INPUTS:
 			prepareOverwriteInputs();
 			break;
+		case CMD_RECEIVE_GAME_INFO:
+			// Extract per-port player types (0 = human, 1 = cpu, 2 = demo,
+			// 3 = empty) from the Slippi GAME_START event so the blocking
+			// pipe input path (Pipes.cpp) knows which ports carry real,
+			// frame-paced bot input. Offsets per the .slp spec: the game
+			// info block starts at 0x5, player type at +0x61 + 0x24*i.
+			if (payloadLen + 1 > 0x66 + 0x24 * 3)
+			{
+				for (int i = 0; i < 4; i++)
+					g_slippiPlayerType[i] = memPtr[bufLoc + 0x66 + 0x24 * i];
+				g_slippiInGame = true;
+				if (s_pt_trace)
+					fprintf(stderr, "[PT] GAME_INFO types=%d,%d,%d,%d\n",
+					        g_slippiPlayerType[0], g_slippiPlayerType[1],
+					        g_slippiPlayerType[2], g_slippiPlayerType[3]);
+			}
+			// fall through to the default replay/spectator handling
 		default:
 			writeToFileAsync(&memPtr[bufLoc], payloadLen + 1, "");
 			m_slippiserver->write(&memPtr[bufLoc], payloadLen + 1);
