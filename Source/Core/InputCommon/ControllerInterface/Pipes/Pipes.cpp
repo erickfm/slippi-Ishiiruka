@@ -20,6 +20,8 @@
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "InputCommon/ControllerInterface/Pipes/Pipes.h"
 #include "Core/ConfigManager.h"
+#include "Core/Core.h"
+#include "Core/State.h"
 
 namespace ciface
 {
@@ -274,6 +276,26 @@ bool PipeDevice::ParseCommand(const std::string& command)
   SplitString(command, ' ', tokens);
   if (tokens.size() < 2 || tokens.size() > 4)
     return false;
+  // Savestate control over the bot pipe: "SAVESTATE <path>" /
+  // "LOADSTATE <path>". State::SaveAs/LoadAs use Core::PauseAndLock and
+  // must run on the host thread; UpdateInput runs on the CPU thread, so
+  // queue a host job (MainNoGUI's platform loop dispatches them).
+  if (tokens.size() == 2 && (tokens[0] == "SAVESTATE" || tokens[0] == "LOADSTATE"))
+  {
+    const std::string path = tokens[1];
+    const bool save = (tokens[0] == "SAVESTATE");
+    fprintf(stderr, "[PIPE-SS] queueing %s %s\n", tokens[0].c_str(), path.c_str());
+    ::Core::QueueHostJob([path, save] {
+      fprintf(stderr, "[PIPE-SS] host job running: %s %s\n",
+              save ? "SAVE" : "LOAD", path.c_str());
+      if (save)
+        ::State::SaveAs(path, true);
+      else
+        ::State::LoadAs(path);
+      fprintf(stderr, "[PIPE-SS] host job done: %s\n", save ? "SAVE" : "LOAD");
+    });
+    return false;
+  }
   if (tokens[0] == "PRESS" || tokens[0] == "RELEASE")
   {
     SetButtonState(tokens[1], tokens[0]);

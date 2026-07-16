@@ -392,13 +392,17 @@ int main(int argc, char* argv[])
 		{ "help", no_argument, nullptr, 'h' },
 		{ "version", no_argument, nullptr, 'v' },
 		{ "user", optional_argument, nullptr, 'u'},
+		{ "slippi-input", required_argument, nullptr, 'i'},
+		{ "cout", no_argument, nullptr, 'c'},
 		{ nullptr, 0, nullptr, 0 }
 	};
 
 	std::string iso_path = "";
 	std::string user_path = "";
+	std::string slippi_input = "";
+	bool enable_cout = false;
 
-	while ((ch = getopt_long(argc, argv, "e:h?vu:", longopts, 0)) != -1)
+	while ((ch = getopt_long(argc, argv, "e:h?vu:i:c", longopts, 0)) != -1)
 	{
 		switch (ch)
 		{
@@ -407,6 +411,12 @@ int main(int argc, char* argv[])
 			break;
 		case 'u':
 			user_path.assign(optarg);
+			break;
+		case 'i':
+			slippi_input.assign(optarg);
+			break;
+		case 'c':
+			enable_cout = true;
 			break;
 		case 'h':
 		case '?':
@@ -439,6 +449,14 @@ int main(int argc, char* argv[])
 
 	UICommon::SetUserDirectory(user_path);
 	UICommon::Init();
+
+	// Slippi replay playback comm file (mirrors DolphinWX's -i flag).
+	// Must be applied AFTER UICommon::Init so LoadSettings doesn't
+	// clobber it.
+	if (!slippi_input.empty())
+		SConfig::GetInstance().m_strSlippiInput = slippi_input;
+	if (enable_cout)
+		SConfig::GetInstance().m_coutEnabled = true;
 
 	Core::SetOnStoppedCallback([]() { s_running.Clear(); });
 	platform->Init();
